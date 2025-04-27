@@ -1,0 +1,189 @@
+# captcha_bot.py
+
+import discord
+from discord.ext import commands
+import random
+from captcha.image import ImageCaptcha
+import string
+import json
+import os
+
+# === CONFIG ===
+CAPTCHA_LENGTH = 6
+CONFIG_FILE = "config.json"
+TOKEN = ""
+
+# === BOT SETUP ===
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix="=", case_insensitive=True, intents=intents)
+
+# === HELPER FUNCTIONS ===
+
+async def load_config():
+    if os.path.exists(CONFIG_FILE):
+        async with aiofiles.open(CONFIG_FILE, mode='r') as f:
+            data = await f.read()
+            return json.loads(data)
+    return None
+
+async def save_config(data: dict):
+    async with aiofiles.open(CONFIG_FILE, mode='w') as f:
+        await f.write(json.dumps(data, indent=4))
+
+def generate_captcha_text(length=CAPTCHA_LENGTH):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
+def generate_captcha_image(text, file_path):
+    image = ImageCaptcha(width=280, height=90)
+    image.write(text, file_path)
+
+def get_guild_objects(bot, config):
+    guild = bot.get_guild(config["guild"])
+    channel = guild.get_channel(config["channel"])
+    role = guild.get_role(config["role"])
+    return guild, channel, role
+
+async def send_captcha(member, verify_channel, captcha_text, file_path):
+    file = discord.File(file_path, filename=os.path.basename(file_path))
+    embed = discord.Embed(
+        title="Verification",
+        description=("This server is using Captcha Verification to protect their server.\n\n"
+                     "Please type out the letters you see in the captcha below.\n\n"
+                     "**Note:** The captcha is **case-sensitive.**\n\n"
+                     "You have **30 seconds** to reply."),
+        color=0x9f4fd1
+    )
+    embed.set_image(url=f"attachment://{os.path.basename(file_path)}")
+    return await verify_channel.send(content=member.mention, embed=embed, file=file)
+
+async def kick_member(member, reason="Verification Failed"):
+    try:
+        await member.kick(reason=reason)
+    except discord.Forbidden:
+        pass
+
+async def clean_messages(messages):
+    for msg in messages:
+        try:
+            await msg.delete()
+        except discord.NotFound:
+            continue
+
+# === BOT EVENTS ===
+
+@bot.event
+async def on_ready():
+    print(f"{bot.user} is online.")
+    bot.config = await load_config()
+    if not bot.config:
+        print("No config found! Run =setup in your server!")
+    else:
+        bot.verify_guild, bot.verify_channel, bot.verify_role = get_guild_objects(bot, bot.config)
+        print("Loaded Config!")
+
+@bot.event
+async def on_member_join(member):
+    if not hasattr(bot, 'config') or not bot.config:
+        return
+    if member.guild.id != bot.config["guild"]:
+        return
+
+    await member.add_roles(bot.verify_role)
+
+    captcha_text = generate_captcha_text()
+    file_name = generate_captcha_text(20)
+    file_path = f"captchas/{file_name}.png"
+    generate_captcha_image(captcha_text, file_path)
+
+    del_msgs = []
+    message = await send_captcha(member, bot.verify_channel, captcha_text, file_path)
+    del_msgs.append(message)
+
+    def check(m):
+        return m.author == member and m.channel == bot.verify_channel
+
+    try:
+        for attempt in range(3):
+            reply = await bot.wait_for("message", check=check, timeout=30)
+            if reply.content == captcha_text:
+                await member.remove_roles(bot.verify_role)
+                del_msgs.append(reply)
+                await clean_messages(del_msgs)
+                os.remove(file_path)
+                return
+            else:
+                if attempt < 2:
+                    warn = await bot.verify_channel.send(f"{member.mention} Invalid, {2 - attempt} attempts left.")
+                    del_msgs.extend([warn, reply])
+        await kick_member(member, reason="Too many failed captcha attempts.")
+    except (discord.Forbidden, discord.HTTPException, asyncio.TimeoutError):
+        await kick_member(member, reason="Verification Timeout.")
+
+    await clean_messages(del_msgs)
+    os.remove(file_path)
+
+@bot.event
+async def on_channel_create(channel):
+    if not hasattr(bot, 'config') or not bot.config:
+        return
+    if channel.id == bot.config["channel"]:
+        try:
+            overwrites = {
+                bot.verify_role: discord.PermissionOverwrite(
+                    read_messages=False,
+                    send_messages=False,
+                    add_reactions=False
+                )
+            }
+            await channel.edit(overwrites=overwrites)
+        except discord.Forbidden:
+            pass
+
+# === BOT COMMANDS ===
+
+@bot.command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def setup(ctx):
+    if os.path.exists(CONFIG_FILE):
+        await ctx.send("config.json already exists!")
+        return
+
+    role = await ctx.guild.create_role(name="Verifing")
+    for channel in ctx.guild.channels:
+        try:
+            await channel.set_permissions(role, read_messages=False, send_messages=False, add_reactions=False)
+        except discord.Forbidden:
+            pass
+
+    overwrites = {
+        ctx.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    }
+    verify_channel = await ctx.guild.create_text_channel("verify-here", overwrites=overwrites, slowmode_delay=10)
+
+    bot.config = {"role": role.id, "channel": verify_channel.id, "guild": ctx.guild.id}
+    await save_config(bot.config)
+
+    bot.verify_guild, bot.verify_channel, bot.verify_role = get_guild_objects(bot, bot.config)
+
+    await ctx.send("Finished Setup!")
+
+@bot.command()
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def perms_setup(ctx):
+    if not hasattr(bot, 'config') or not bot.config:
+        await ctx.send("No config loaded!")
+        return
+
+    for channel in ctx.guild.channels:
+        try:
+            await channel.set_permissions(bot.verify_role, read_messages=False, send_messages=False, add_reactions=False)
+        except discord.Forbidden:
+            pass
+
+    await ctx.send("Permissions re-applied successfully.")
+
+# === BOT RUN ===
+bot.run(TOKEN)
